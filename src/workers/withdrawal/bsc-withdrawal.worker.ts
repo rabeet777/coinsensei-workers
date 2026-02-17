@@ -53,7 +53,7 @@ interface ChainConfig {
   name: string;
   rpc_url: string;
   native_currency_decimals: number;
-  chain_id_number?: number; // EVM chain ID
+  chain_id?: number; // EVM chain ID (e.g. 56 for BSC mainnet), from chains.chain_id
 }
 
 export class BscWithdrawalWorker {
@@ -84,7 +84,7 @@ export class BscWithdrawalWorker {
 
     const { data: chain, error } = await this.supabase
       .from('chains')
-      .select('id, name, rpc_url, native_currency_decimals, chain_id_number')
+      .select('id, name, rpc_url, native_currency_decimals, chain_id')
       .eq('name', 'bsc')
       .eq('is_active', true)
       .maybeSingle();
