@@ -1,0 +1,1 @@
+{"version":3,"file":"tron.confirmation.client.d.ts","sourceRoot":"","sources":["tron.confirmation.client.ts"],"names":[],"mappings":"AAIA,qBAAa,sBAAsB;IACjC,OAAO,CAAC,OAAO,CAAM;IACrB,OAAO,CAAC,MAAM,CAAS;IACvB,OAAO,CAAC,QAAQ,CAAC,WAAW,CAAK;gBAErB,MAAM,EAAE,MAAM;IAO1B;;OAEG;IACG,qBAAqB,IAAI,OAAO,CAAC,MAAM,CAAC;IAO9C;;OAEG;YACW,gBAAgB;CA4B/B"}

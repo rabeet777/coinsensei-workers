@@ -1,0 +1,745 @@
+import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseClient } from '../../config/supabase.js';
+import { logger } from '../../utils/logger.js';
+import { sleep } from '../../utils/sleep.js';
+
+interface WalletBalance {
+  id: string;
+  wallet_id: string;
+  asset_on_chain_id: string;
+  on_chain_balance_raw: string | null;
+  on_chain_balance_human: string | null;
+  processing_status: string;
+  locked_until: string | null;
+  locked_by: string | null;
+  needs_consolidation: boolean | null;
+  needs_gas: boolean | null;
+}
+
+interface AssetOnChain {
+  id: string;
+  chain_id: string;
+  asset_id: string;
+  is_native: boolean;
+}
+
+interface ConsolidationRule {
+  id: string;
+  chain_id: string;
+  asset_on_chain_id: string;
+  threshold_human: string;
+  comparison_operator: string;
+  priority: number;
+  is_active: boolean;
+  metadata: any;
+}
+
+interface GasTopupRule {
+  id: string;
+  chain_id: string;
+  gas_asset_id: string;
+  threshold_human: string;
+  comparison_operator: string;
+  priority: number;
+  is_active: boolean;
+  metadata: any; // Contains: topup_amount_human, topup_amount_raw (optional), operation_wallet_id (optional)
+}
+
+export class RuleExecutionWorker {
+  private supabase: SupabaseClient;
+  private isRunning: boolean = false;
+  private readonly WORKER_ID = `rule_execution_${process.pid}`;
+  private readonly BATCH_SIZE = 50;
+  private readonly LOCK_DURATION_SECONDS = 120; // 2 minutes
+  private readonly EXECUTION_INTERVAL_MS = 30000; // 30 seconds
+
+  constructor() {
+    this.supabase = getSupabaseClient();
+  }
+
+  /**
+   * Initialize worker
+   */
+  async initialize(): Promise<void> {
+    logger.info('Initializing Rule Execution Worker...');
+
+    logger.info(
+      {
+        workerId: this.WORKER_ID,
+        batchSize: this.BATCH_SIZE,
+      },
+      'Rule Execution Worker initialized successfully'
+    );
+  }
+
+        logger.info({ workerId: this.workerId, count: claimed.length }, 'Processing batch of wallet balances');
+
+        for (const wb of claimed) {
+          await this.processWalletBalance(wb);
+        }
+      } catch (err) {
+        logger.error({ workerId: this.workerId, err }, 'Rule Execution loop error');
+      }
+
+      await sleep(this.sleepMs);
+    }
+  }
+
+  // -------------------------
+  // Step 1: Claim batch
+  // -------------------------
+  private async claimBatch(): Promise<WalletBalanceRow[]> {
+    const { data, error } = await this.supabase
+      .from('wallet_balances')
+      .select('*')
+      .eq('processing_status', 'idle')
+      .or('locked_until.is.null,locked_until.lt.' + nowIso())
+      .order('last_checked', { ascending: true, nullsFirst: true })
+      .limit(this.batchSize);
+
+    if (error) {
+      logger.error({ workerId: this.workerId, error }, 'Failed to select wallet_balances batch');
+      return [];
+    }
+    if (!data || data.length === 0) return [];
+
+    const locked: WalletBalanceRow[] = [];
+
+    for (const row of data as WalletBalanceRow[]) {
+      const ok = await this.tryLock(row.id);
+      if (ok) locked.push(row);
+    }
+
+    return locked;
+  }
+
+  private async tryLock(walletBalanceId: UUID): Promise<boolean> {
+    const lockedUntil = new Date(Date.now() + this.lockMinutes * 60_000).toISOString();
+    const lockedBy = `rule_execution_worker:${this.workerId}`;
+
+    const { data, error } = await this.supabase
+      .from('wallet_balances')
+      .update({
+        locked_until: lockedUntil,
+        locked_by: lockedBy,
+        processing_status: 'processing',
+      })
+      .eq('id', walletBalanceId)
+      .or('locked_until.is.null,locked_until.lt.' + nowIso())
+      .eq('processing_status', 'idle')
+      .select('id')
+      .maybeSingle();
+
+    if (error) return false;
+    return !!data;
+  }
+
+  // -------------------------
+  // Step 2+: Process each wallet balance
+  // -------------------------
+  private async processWalletBalance(wb: WalletBalanceRow): Promise<void> {
+    const start = Date.now();
+
+    try {
+      // Load asset_on_chain & chain
+      const assetOnChain = await this.getAssetOnChain(wb.asset_on_chain_id);
+      if (!assetOnChain || !assetOnChain.is_active) {
+        await this.finalize(wb.id);
+        return;
+      }
+
+      const chain = await this.getChain(assetOnChain.chain_id);
+      if (!chain || !chain.is_active) {
+        await this.finalize(wb.id);
+        return;
+      }
+
+      // Determine the chain’s native asset_on_chain (gas asset on chain)
+      const nativeAoc = await this.getNativeAssetOnChain(assetOnChain.chain_id);
+      if (!nativeAoc) {
+        throw new Error(`No native asset_on_chain found for chain_id=${assetOnChain.chain_id}`);
+      }
+
+      // Load wallet’s native wallet_balances row (gas balance row)
+      const nativeWb = await this.getWalletBalanceByWalletAndAsset(wb.wallet_id, nativeAoc.id);
+      if (!nativeWb) {
+        throw new Error(
+          `Native wallet_balances row missing for wallet_id=${wb.wallet_id} native_aoc_id=${nativeAoc.id}`
+        );
+      }
+
+      // ================
+      // GAS RULES FIRST (wallet-level)
+      // ================
+      const gasResult = await this.evaluateGasRulesAndMaybeEnqueue({
+        chain,
+        currentWalletBalanceRow: wb,
+        nativeWalletBalanceRow: nativeWb,
+        nativeAssetOnChain: nativeAoc,
+      });
+
+      if (gasResult.gasNeeded) {
+        // Gas is a hard dependency: do not evaluate consolidation
+        await this.finalize(wb.id);
+        return;
+      }
+
+      // ================
+      // CONSOLIDATION RULES
+      // ================
+      // IMPORTANT: Only evaluate consolidation on NON-native asset rows OR on specific rule types.
+      // If your consolidation_rules include native consolidation, you can allow native too.
+      const consolidationResult = await this.evaluateConsolidationRulesAndMaybeEnqueue({
+        chain,
+        walletBalanceRow: wb,
+        assetOnChain,
+        nativeWalletBalanceRow: nativeWb,
+        nativeAssetOnChain: nativeAoc,
+      });
+
+      // finalize row
+      await this.finalize(wb.id);
+
+      const ms = Date.now() - start;
+      logger.info(
+        {
+          workerId: this.workerId,
+          walletBalanceId: wb.id,
+          walletId: wb.wallet_id,
+          chain: chain.name,
+          gasNeeded: gasResult.gasNeeded,
+          consolidationEnqueued: consolidationResult.consolidationEnqueued,
+          durationMs: ms,
+        },
+        'Rule execution completed for wallet_balance'
+      );
+    } catch (err: any) {
+      await this.fail(wb.id, err?.message ?? String(err));
+      const ms = Date.now() - start;
+      logger.error(
+        { workerId: this.workerId, walletBalanceId: wb.id, error: err?.message ?? String(err), durationMs: ms },
+        'Error processing wallet_balance in rule execution worker'
+      );
+    }
+  }
+
+  // -------------------------
+  // GAS EVALUATION + ENQUEUE (wallet-level)
+  // -------------------------
+  private async evaluateGasRulesAndMaybeEnqueue(args: {
+    chain: ChainRow;
+    currentWalletBalanceRow: WalletBalanceRow;
+    nativeWalletBalanceRow: WalletBalanceRow;
+    nativeAssetOnChain: AssetOnChainRow;
+  }): Promise<{ gasNeeded: boolean }> {
+    const { chain, currentWalletBalanceRow, nativeWalletBalanceRow, nativeAssetOnChain } = args;
+
+    // Load active gas rules for this chain and gas asset (assets table id is gas_asset_id)
+    // We infer gas_asset_id from nativeAssetOnChain.asset_id (assets.id).
+    const gasRules = await this.getGasTopupRules(chain.id, nativeAssetOnChain.asset_id);
+    if (gasRules.length === 0) {
+      // No gas policy configured, treat as "no gas needed"
+      return { gasNeeded: false };
+    }
+
+    const nativeBalanceHuman = toDecimalString(nativeWalletBalanceRow.on_chain_balance_human);
+
+    // Evaluate rules in execution_order
+    for (const rule of gasRules) {
+      const t0 = Date.now();
+
+      const op: ComparisonOperator = (rule.comparison_operator ?? '<') as ComparisonOperator;
+      const threshold = toDecimalString(rule.threshold_human);
+      const passes = compareDecimalStrings(nativeBalanceHuman, op, threshold);
+
+      const durationMs = Date.now() - t0;
+
+      await this.insertGasRuleLog({
+        ruleId: rule.id,
+        walletId: currentWalletBalanceRow.wallet_id,
+        executionResult: passes,
+        executionData: {
+          native_balance_human: nativeBalanceHuman,
+          threshold_human: threshold,
+          comparison_operator: op,
+          chain_id: chain.id,
+          native_asset_on_chain_id: nativeAssetOnChain.id,
+        },
+        executionTimeMs: durationMs,
+      });
+
+      if (!passes) continue;
+
+      // Gas is required. Set flags.
+      await this.supabase
+        .from('wallet_balances')
+        .update({
+          needs_gas: true,
+          gas_priority: rule.priority ?? 'normal',
+        })
+        .eq('wallet_id', currentWalletBalanceRow.wallet_id);
+
+      // Enqueue gas topup (idempotent)
+      await this.enqueueGasTopupJob({
+        chainId: chain.id,
+        walletId: currentWalletBalanceRow.wallet_id,
+        gasAssetId: nativeAssetOnChain.asset_id,
+        currentGasBalanceRaw: nativeWalletBalanceRow.on_chain_balance_raw,
+        rule,
+      });
+
+      return { gasNeeded: true };
+    }
+
+    // If no rule passed, ensure needs_gas is false (optional; safe cleanup)
+    await this.supabase
+      .from('wallet_balances')
+      .update({
+        needs_gas: false,
+      })
+      .eq('wallet_id', currentWalletBalanceRow.wallet_id)
+      .eq('asset_on_chain_id', nativeAssetOnChain.id);
+
+    return { gasNeeded: false };
+  }
+
+  private async enqueueGasTopupJob(args: {
+    chainId: UUID;
+    walletId: UUID;
+    gasAssetId: UUID;
+    currentGasBalanceRaw: string;
+    rule: GasTopupRuleRow;
+  }): Promise<void> {
+    const { chainId, walletId, gasAssetId, currentGasBalanceRaw, rule } = args;
+
+    // Strict idempotency check: chain + wallet + gas_asset + pending/processing
+    const { data: existing } = await this.supabase
+      .from('gas_topup_queue')
+      .select('id')
+      .eq('chain_id', chainId)
+      .eq('wallet_id', walletId)
+      .eq('gas_asset_id', gasAssetId)
+      .in('status', ['pending', 'processing'])
+      .maybeSingle();
+
+    if (existing) return;
+
+    const md = rule.metadata ?? {};
+
+    const topupAmountRaw: string | undefined = md.topup_amount_raw;
+    const topupAmountHuman: string | undefined = md.topup_amount_human;
+
+    if (!topupAmountRaw && !topupAmountHuman) {
+      throw new Error(`Gas topup rule ${rule.id} missing metadata.topup_amount_human`);
+    }
+
+    // Determine operation_wallet_id (gas wallet), chain-matched
+    const opWalletId = await this.selectGasOperationWalletId(chainId, md.operation_wallet_id);
+
+    // If raw is missing but human exists, store human; raw can be computed in execution worker later.
+    const payload = {
+      chain_id: chainId,
+      wallet_id: walletId,
+      operation_wallet_id: opWalletId,
+      topup_amount_raw: topupAmountRaw ?? '0', // execution worker may compute raw; but schema requires NOT NULL
+      topup_amount_human: topupAmountHuman ?? 0,
+      gas_asset_id: gasAssetId,
+      current_gas_balance_raw: currentGasBalanceRaw,
+      priority: (rule.priority ?? 'normal') as Priority,
+      reason: 'low_balance',
+      status: 'pending',
+      retry_count: 0,
+      max_retries: 3,
+      scheduled_at: nowIso(),
+    };
+
+    // IMPORTANT: Your gas_topup_queue schema does NOT have current_gas_balance_human -> do not insert it.
+    const { error } = await this.supabase.from('gas_topup_queue').insert(payload as any);
+    if (error) throw error;
+  }
+
+  private async selectGasOperationWalletId(chainId: UUID, overrideOperationWalletId?: string): Promise<UUID> {
+    // 1) metadata override
+    if (overrideOperationWalletId) {
+      const ow = await this.getOperationWalletById(overrideOperationWalletId);
+      if (!ow || !ow.is_active || ow.chain_id !== chainId) {
+        throw new Error(`Invalid gas operation_wallet_id override for chain ${chainId}`);
+      }
+      await this.touchOperationWallet(ow.id);
+      return ow.id;
+    }
+
+    // 2) select purpose='gas'
+    const gasOw = await this.selectOperationWalletRoundRobin(chainId, 'gas');
+    if (gasOw) return gasOw.id;
+
+    // 3) fallback to hot
+    const hotOw = await this.selectOperationWalletRoundRobin(chainId, 'hot');
+    if (hotOw) return hotOw.id;
+
+    throw new Error(`No active gas wallet (or hot wallet fallback) found for chain ${chainId}`);
+  }
+
+  // -------------------------
+  // CONSOLIDATION EVALUATION + ENQUEUE
+  // -------------------------
+  private async evaluateConsolidationRulesAndMaybeEnqueue(args: {
+    chain: ChainRow;
+    walletBalanceRow: WalletBalanceRow;
+    assetOnChain: AssetOnChainRow;
+    nativeWalletBalanceRow: WalletBalanceRow;
+    nativeAssetOnChain: AssetOnChainRow;
+  }): Promise<{ consolidationEnqueued: boolean }> {
+    const { chain, walletBalanceRow, assetOnChain, nativeWalletBalanceRow, nativeAssetOnChain } = args;
+
+    // Load applicable consolidation rules
+    const rules = await this.getConsolidationRules(chain.id, assetOnChain.id);
+    if (rules.length === 0) return { consolidationEnqueued: false };
+
+    const balanceHuman = toDecimalString(walletBalanceRow.on_chain_balance_human);
+
+    for (const rule of rules) {
+      const t0 = Date.now();
+
+      const op: ComparisonOperator = (rule.comparison_operator ?? '>') as ComparisonOperator;
+      const threshold = toDecimalString(rule.threshold_human);
+      const passes = compareDecimalStrings(balanceHuman, op, threshold);
+
+      const durationMs = Date.now() - t0;
+
+      await this.insertConsolidationRuleLog({
+        ruleId: rule.id,
+        walletId: walletBalanceRow.wallet_id,
+        executionResult: passes,
+        executionData: {
+          balance_human: balanceHuman,
+          threshold_human: threshold,
+          comparison_operator: op,
+          chain_id: chain.id,
+          asset_on_chain_id: assetOnChain.id,
+        },
+        executionTimeMs: durationMs,
+      });
+
+      if (!passes) continue;
+
+      // Rule passes: set intent flag
+      await this.supabase
+        .from('wallet_balances')
+        .update({
+          needs_consolidation: true,
+          consolidation_priority: rule.priority ?? 'normal',
+        })
+        .eq('id', walletBalanceRow.id);
+
+      // CROSS-ASSET GAS GATING SAFETY NET:
+      // Even though gas rules ran earlier, we MUST re-check gas readiness here.
+      const gasRules = await this.getGasTopupRules(chain.id, nativeAssetOnChain.asset_id);
+      const nativeBalanceHuman = toDecimalString(nativeWalletBalanceRow.on_chain_balance_human);
+
+      for (const gasRule of gasRules) {
+        const op2: ComparisonOperator = (gasRule.comparison_operator ?? '<') as ComparisonOperator;
+        const thr2 = toDecimalString(gasRule.threshold_human);
+        const gasNeeded = compareDecimalStrings(nativeBalanceHuman, op2, thr2);
+
+        // Log gas evaluation during consolidation gating? Optional. We'll keep logs clean:
+        // if gasNeeded -> set needs_gas + enqueue and stop.
+        if (gasNeeded) {
+          await this.supabase
+            .from('wallet_balances')
+            .update({
+              needs_gas: true,
+              gas_priority: gasRule.priority ?? 'normal',
+            })
+            .eq('wallet_id', walletBalanceRow.wallet_id);
+
+          await this.enqueueGasTopupJob({
+            chainId: chain.id,
+            walletId: walletBalanceRow.wallet_id,
+            gasAssetId: nativeAssetOnChain.asset_id,
+            currentGasBalanceRaw: nativeWalletBalanceRow.on_chain_balance_raw,
+            rule: gasRule,
+          });
+
+          // hard stop: no consolidation enqueue
+          return { consolidationEnqueued: false };
+        }
+      }
+
+      // FINAL GATING: do not enqueue if needs_gas=true anywhere
+      const { data: latestNativeRow } = await this.supabase
+        .from('wallet_balances')
+        .select('needs_gas')
+        .eq('wallet_id', walletBalanceRow.wallet_id)
+        .eq('asset_on_chain_id', nativeAssetOnChain.id)
+        .maybeSingle();
+
+      if (latestNativeRow?.needs_gas) {
+        return { consolidationEnqueued: false };
+      }
+
+      // Enqueue consolidation (idempotent)
+      const enqueued = await this.enqueueConsolidationJob({
+        chainId: chain.id,
+        walletId: walletBalanceRow.wallet_id,
+        walletBalanceId: walletBalanceRow.id,
+        amountRaw: walletBalanceRow.on_chain_balance_raw,
+        amountHuman: balanceHuman,
+        priority: (rule.priority ?? 'normal') as Priority,
+        ruleId: rule.id,
+      });
+
+      return { consolidationEnqueued: enqueued };
+    }
+
+    return { consolidationEnqueued: false };
+  }
+
+  private async enqueueConsolidationJob(args: {
+    chainId: UUID;
+    walletId: UUID;
+    walletBalanceId: UUID;
+    amountRaw: string;
+    amountHuman: string;
+    priority: Priority;
+    ruleId: UUID;
+  }): Promise<boolean> {
+    const { chainId, walletId, walletBalanceId, amountRaw, amountHuman, priority, ruleId } = args;
+
+    // Idempotency: do not create multiple pending/processing jobs for the same wallet_balance_id
+    const { data: existing } = await this.supabase
+      .from('consolidation_queue')
+      .select('id')
+      .eq('wallet_balance_id', walletBalanceId)
+      .in('status', ['pending', 'processing'])
+      .maybeSingle();
+
+    if (existing) return false;
+
+    // Select hot wallet for this chain (round-robin)
+    const hot = await this.selectOperationWalletRoundRobin(chainId, 'hot');
+    if (!hot) throw new Error(`No active hot wallet found for chain ${chainId}`);
+
+    const payload = {
+      chain_id: chainId,
+      wallet_id: walletId,
+      wallet_balance_id: walletBalanceId,
+      operation_wallet_id: hot.id,
+      amount_raw: amountRaw,
+      amount_human: amountHuman,
+      priority,
+      status: 'pending',
+      retry_count: 0,
+      max_retries: 3,
+      scheduled_at: nowIso(),
+      // You can store rule_id in a new column later; for now keep it in error_message? Better: leave out.
+      // If you later add columns: rule_id, reason -> put them here.
+    };
+
+    const { error } = await this.supabase.from('consolidation_queue').insert(payload as any);
+    if (error) throw error;
+
+    return true;
+  }
+
+  // -------------------------
+  // Operation wallet routing
+  // -------------------------
+  private async selectOperationWalletRoundRobin(chainId: UUID, purpose: string): Promise<OperationWalletRow | null> {
+    const { data, error } = await this.supabase
+      .from('operation_wallets')
+      .select('id, chain_id, purpose, is_active, last_used_at')
+      .eq('is_active', true)
+      .eq('chain_id', chainId)
+      .eq('purpose', purpose)
+      .order('last_used_at', { ascending: true, nullsFirst: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return null;
+
+    await this.touchOperationWallet((data as OperationWalletRow).id);
+    return data as OperationWalletRow;
+  }
+
+  private async touchOperationWallet(operationWalletId: UUID): Promise<void> {
+    // Best-effort routing state update
+    await this.supabase
+      .from('operation_wallets')
+      .update({ last_used_at: nowIso() })
+      .eq('id', operationWalletId);
+  }
+
+  private async getOperationWalletById(id: UUID): Promise<OperationWalletRow | null> {
+    const { data, error } = await this.supabase
+      .from('operation_wallets')
+      .select('id, chain_id, purpose, is_active, last_used_at')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) throw error;
+    return (data as OperationWalletRow) ?? null;
+  }
+
+  // -------------------------
+  // Rule logs
+  // -------------------------
+  private async insertConsolidationRuleLog(args: {
+    ruleId: UUID;
+    walletId: UUID;
+    executionResult: boolean;
+    executionData: Record<string, any>;
+    executionTimeMs: number;
+  }): Promise<void> {
+    const { ruleId, walletId, executionResult, executionData, executionTimeMs } = args;
+
+    const payload = {
+      rule_id: ruleId,
+      wallet_id: walletId,
+      execution_result: executionResult,
+      execution_data: executionData,
+      execution_time_ms: executionTimeMs,
+      created_at: nowIso(),
+    };
+
+    const { error } = await this.supabase.from('consolidation_rule_logs').insert(payload as any);
+    if (error) throw error;
+  }
+
+  private async insertGasRuleLog(args: {
+    ruleId: UUID;
+    walletId: UUID;
+    executionResult: boolean;
+    executionData: Record<string, any>;
+    executionTimeMs: number;
+  }): Promise<void> {
+    const { ruleId, walletId, executionResult, executionData, executionTimeMs } = args;
+
+    const payload = {
+      rule_id: ruleId,
+      wallet_id: walletId,
+      execution_result: executionResult,
+      execution_data: executionData,
+      execution_time_ms: executionTimeMs,
+      created_at: nowIso(),
+    };
+
+    const { error } = await this.supabase.from('gas_topup_rule_logs').insert(payload as any);
+    if (error) throw error;
+  }
+
+  // -------------------------
+  // DB helpers
+  // -------------------------
+  private async getAssetOnChain(id: UUID): Promise<AssetOnChainRow | null> {
+    const { data, error } = await this.supabase
+      .from('asset_on_chain')
+      .select('id, chain_id, asset_id, contract_address, decimals, is_native, is_active')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) throw error;
+    return (data as AssetOnChainRow) ?? null;
+  }
+
+  private async getChain(id: UUID): Promise<ChainRow | null> {
+    const { data, error } = await this.supabase
+      .from('chains')
+      .select('id, name, is_active')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) throw error;
+    return (data as ChainRow) ?? null;
+  }
+
+  private async getNativeAssetOnChain(chainId: UUID): Promise<AssetOnChainRow | null> {
+    const { data, error } = await this.supabase
+      .from('asset_on_chain')
+      .select('id, chain_id, asset_id, contract_address, decimals, is_native, is_active')
+      .eq('chain_id', chainId)
+      .eq('is_native', true)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (error) throw error;
+    return (data as AssetOnChainRow) ?? null;
+  }
+
+  private async getWalletBalanceByWalletAndAsset(walletId: UUID, assetOnChainId: UUID): Promise<WalletBalanceRow | null> {
+    const { data, error } = await this.supabase
+      .from('wallet_balances')
+      .select('*')
+      .eq('wallet_id', walletId)
+      .eq('asset_on_chain_id', assetOnChainId)
+      .maybeSingle();
+
+    if (error) throw error;
+    return (data as WalletBalanceRow) ?? null;
+  }
+
+  private async getGasTopupRules(chainId: UUID, gasAssetId: UUID): Promise<GasTopupRuleRow[]> {
+    const { data, error } = await this.supabase
+      .from('gas_topup_rules')
+      .select('id, chain_id, gas_asset_id, rule_type, rule_name, threshold_raw, threshold_human, comparison_operator, priority, is_active, execution_order, metadata')
+      .eq('chain_id', chainId)
+      .eq('gas_asset_id', gasAssetId)
+      .eq('is_active', true)
+      .order('execution_order', { ascending: true });
+
+    if (error) throw error;
+    return (data as GasTopupRuleRow[]) ?? [];
+  }
+
+  private async getConsolidationRules(chainId: UUID, assetOnChainId: UUID): Promise<ConsolidationRuleRow[]> {
+    const { data, error } = await this.supabase
+      .from('consolidation_rules')
+      .select('id, chain_id, asset_on_chain_id, rule_type, rule_name, threshold_raw, threshold_human, comparison_operator, priority, is_active, execution_order, metadata')
+      .eq('chain_id', chainId)
+      .eq('asset_on_chain_id', assetOnChainId)
+      .eq('is_active', true)
+      .order('execution_order', { ascending: true });
+
+    if (error) throw error;
+    return (data as ConsolidationRuleRow[]) ?? [];
+  }
+
+  // -------------------------
+  // Finalization
+  // -------------------------
+  private async finalize(walletBalanceId: UUID): Promise<void> {
+    await this.supabase
+      .from('wallet_balances')
+      .update({
+        processing_status: 'idle',
+        last_processed_at: nowIso(),
+        locked_until: null,
+        locked_by: null,
+      })
+      .eq('id', walletBalanceId);
+  }
+
+  private async fail(walletBalanceId: UUID, message: string): Promise<void> {
+    // increment error_count safely (read then update is OK for error counts; no money impact)
+    const { data } = await this.supabase
+      .from('wallet_balances')
+      .select('error_count')
+      .eq('id', walletBalanceId)
+      .maybeSingle();
+
+    const current = (data?.error_count ?? 0) as number;
+
+    await this.supabase
+      .from('wallet_balances')
+      .update({
+        error_count: current + 1,
+        last_error: message,
+        last_error_at: nowIso(),
+        processing_status: 'idle',
+        locked_until: null,
+        locked_by: null,
+      })
+      .eq('id', walletBalanceId);
+  }
+}

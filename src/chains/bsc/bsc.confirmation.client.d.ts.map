@@ -1,0 +1,1 @@
+{"version":3,"file":"bsc.confirmation.client.d.ts","sourceRoot":"","sources":["bsc.confirmation.client.ts"],"names":[],"mappings":"AAIA,qBAAa,qBAAqB;IAChC,OAAO,CAAC,QAAQ,CAAyB;IACzC,OAAO,CAAC,MAAM,CAAS;IACvB,OAAO,CAAC,QAAQ,CAAC,WAAW,CAAK;gBAErB,MAAM,EAAE,MAAM;IAK1B;;OAEG;IACG,qBAAqB,IAAI,OAAO,CAAC,MAAM,CAAC;IAM9C;;OAEG;YACW,gBAAgB;CA4B/B"}
