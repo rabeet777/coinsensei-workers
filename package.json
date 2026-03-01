@@ -21,6 +21,7 @@
     "start:tron-withdrawal": "tsx src/index-tron-withdrawal.ts",
     "start:bsc-withdrawal": "tsx src/index-bsc-withdrawal.ts",
     "start:withdrawal-confirmation": "tsx src/index-withdrawal-confirmation.ts",
+    "start:risk-engine": "tsx src/index-withdrawal-risk-engine.ts",
     "dev": "tsx watch src/index.ts",
     "dev:tron": "tsx watch src/index.ts",
     "dev:bsc": "tsx watch src/index-bsc.ts",
@@ -37,6 +38,7 @@
     "dev:tron-withdrawal": "tsx watch src/index-tron-withdrawal.ts",
     "dev:bsc-withdrawal": "tsx watch src/index-bsc-withdrawal.ts",
     "dev:withdrawal-confirmation": "tsx watch src/index-withdrawal-confirmation.ts",
+    "dev:risk-engine": "tsx watch src/index-withdrawal-risk-engine.ts",
     "build": "tsc",
     "verify": "bash scripts/verify-setup.sh",
     "test": "echo \"Error: no test specified\" && exit 1"

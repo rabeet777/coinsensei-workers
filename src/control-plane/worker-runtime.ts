@@ -38,6 +38,7 @@ export const WORKER_TYPE_TO_DOMAIN: Record<string, WorkerDomain> = {
   gas_topup_confirmation: 'gas',
   consolidation_execute: 'consolidation',
   consolidation_confirmation: 'consolidation',
+  withdrawal_risk_engine: 'withdrawals',
   withdrawal_enqueue: 'withdrawals',
   withdrawal_execute: 'withdrawals',
   withdrawal_confirmation: 'withdrawals',
